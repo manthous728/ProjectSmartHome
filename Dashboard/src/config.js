@@ -25,14 +25,22 @@ export const MQTT_CONFIG = {
         mq2: {
             smokeMax: 500,
             smokeWarn: 350,
+            lpgMax: 1000,
+            lpgWarn: 500,
+            coMax: 500,
+            coWarn: 200,
         },
         pzem004t: {
             powerMax: 2000,
             voltageMin: 180,
             voltageMax: 240,
+            currentMax: 10,
+            energyMax: 100,
+            pfMin: 0.85,
         },
         bh1750: {
-            luxMax: 100000,
+            luxMax: 1000,
+            luxMin: 0,
         },
     },
 };

@@ -52,7 +52,17 @@ def init_db():
                 );
             """)
             
-            # Check defaults
+            # Create settings table for threshold configurations
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    id SERIAL PRIMARY KEY,
+                    setting_key TEXT UNIQUE NOT NULL,
+                    setting_value JSONB NOT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            
+            # Check defaults for status_relay
             cur.execute("SELECT COUNT(*) as count FROM status_relay")
             if cur.fetchone()['count'] == 0:
                  print("Seeding default status_relay...")
@@ -63,6 +73,22 @@ def init_db():
                     (3, 'Exhaust Fan', 27, false),
                     (4, 'Door Lock', 26, false)
                  """)
+            
+            # Check defaults for app_settings (thresholds)
+            cur.execute("SELECT COUNT(*) as count FROM app_settings WHERE setting_key = 'thresholds'")
+            if cur.fetchone()['count'] == 0:
+                print("Seeding default threshold settings...")
+                default_thresholds = {
+                    "dht22": {"tempMax": 35, "tempMin": 15, "humMax": 80, "humMin": 30},
+                    "mq2": {"smokeMax": 500, "smokeWarn": 350, "lpgMax": 1000, "lpgWarn": 500, "coMax": 500, "coWarn": 200},
+                    "pzem004t": {"powerMax": 2000, "voltageMin": 180, "voltageMax": 240, "currentMax": 10, "energyMax": 100, "pfMin": 0.85},
+                    "bh1750": {"luxMax": 100000, "luxMin": 0}
+                }
+                import json
+                cur.execute(
+                    "INSERT INTO app_settings (setting_key, setting_value) VALUES (%s, %s)",
+                    ('thresholds', json.dumps(default_thresholds))
+                )
     except Exception as e:
         print(f"Database init error: {e}")
 
@@ -455,10 +481,10 @@ TABLES = {
 
 # Mapping kolom per sensor (Updated to match DB schema)
 COLUMNS = {
-    "dht22": ["id", "temperature", "humidity", "timestamp"],
-    "mq2": ["id", "gas_lpg", "gas_co", "smoke", "timestamp"],
-    "pzem004t": ["id", "voltage", "current", "power", "energy", "power_factor", "timestamp"],
-    "bh1750": ["id", "lux", "timestamp"]
+    "dht22": ["timestamp", "id", "temperature", "humidity"],
+    "mq2": ["timestamp", "id", "gas_lpg", "gas_co", "smoke"],
+    "pzem004t": ["timestamp", "id", "voltage", "current", "power", "energy", "power_factor"],
+    "bh1750": ["timestamp", "id", "lux"]
 }
 
 # Range waktu dengan interval sampling optimal
@@ -648,10 +674,11 @@ def export_excel(sensor: str):
         
         with get_cursor() as cur:
             # Fetch all data descending (newest first)
-            cur.execute(f"SELECT * FROM {table} ORDER BY timestamp DESC")
+            col_list = ", ".join(columns)
+            cur.execute(f"SELECT {col_list} FROM {table} ORDER BY timestamp DESC")
             
-            # Get column names
-            col_names = [desc[0] for desc in cur.description]
+            # Use defined columns order
+            col_names = columns
             
             # Style for header
             header_font = Font(bold=True, color="FFFFFF")
@@ -700,3 +727,210 @@ def export_excel(sensor: str):
         raise HTTPException(500, "openpyxl not installed. Run: pip install openpyxl")
     except Exception as e:
         raise HTTPException(500, f"Export error: {e}")
+
+
+# =========================================
+# SETTINGS ENDPOINTS
+# =========================================
+class SettingsUpdate(BaseModel):
+    thresholds: dict
+    enable_thresholds: Optional[bool] = True
+    telegram_config: Optional[dict] = None
+
+class TelegramTest(BaseModel):
+    bot_token: str
+    chat_id: str
+    message: str = "Test notifikasi dari Smart Home Dashboard! 🚀"
+
+@app.get("/settings")
+def get_settings():
+    """Get all application settings including thresholds"""
+    try:
+        with get_cursor() as cur:
+            cur.execute("SELECT setting_key, setting_value FROM app_settings")
+            rows = cur.fetchall()
+            
+            settings = {}
+            for row in rows:
+                settings[row['setting_key']] = row['setting_value']
+            
+            # Return default if no settings found
+            if not settings.get('thresholds'):
+                settings['thresholds'] = {
+                    "dht22": {"tempMax": 35, "tempMin": 15, "humMax": 80, "humMin": 30},
+                    "mq2": {"smokeMax": 500, "smokeWarn": 350, "lpgMax": 1000, "lpgWarn": 500, "coMax": 500, "coWarn": 200},
+                    "pzem004t": {"powerMax": 2000, "voltageMin": 180, "voltageMax": 240, "currentMax": 10, "energyMax": 100, "pfMin": 0.85},
+                    "bh1750": {"luxMax": 100000, "luxMin": 0}
+                }
+            
+            # Get enable_thresholds setting (default to True if not found)
+            if 'enable_thresholds' not in settings:
+                settings['enable_thresholds'] = True
+                
+            # Get telegram_config setting (default dict if not found)
+            if 'telegram_config' not in settings:
+                settings['telegram_config'] = {"bot_token": "", "chat_id": "", "enabled": False}
+            
+            return {"success": True, "settings": settings}
+    except Exception as e:
+        raise HTTPException(500, f"Error fetching settings: {e}")
+
+
+@app.put("/settings")
+def update_settings(settings_data: SettingsUpdate):
+    """Update application settings (thresholds)"""
+    try:
+        thresholds = settings_data.thresholds
+        
+        # Validate thresholds
+        errors = []
+        
+        # DHT22 validation
+        if 'dht22' in thresholds:
+            dht = thresholds['dht22']
+            if dht.get('tempMin') is not None and dht.get('tempMax') is not None:
+                if dht['tempMin'] > dht['tempMax']:
+                    errors.append("Suhu Min tidak boleh lebih besar dari Suhu Max")
+            if dht.get('humMin') is not None and dht.get('humMax') is not None:
+                if dht['humMin'] > dht['humMax']:
+                    errors.append("Kelembaban Min tidak boleh lebih besar dari Kelembaban Max")
+        
+        # MQ2 validation
+        if 'mq2' in thresholds:
+            mq = thresholds['mq2']
+            if mq.get('smokeWarn') is not None and mq.get('smokeMax') is not None:
+                if mq['smokeWarn'] > mq['smokeMax']:
+                    errors.append("Smoke Waspada tidak boleh lebih besar dari Smoke Bahaya")
+        
+        # PZEM004T validation
+        if 'pzem004t' in thresholds:
+            pz = thresholds['pzem004t']
+            if pz.get('voltageMin') is not None and pz.get('voltageMax') is not None:
+                if pz['voltageMin'] > pz['voltageMax']:
+                    errors.append("Tegangan Min tidak boleh lebih besar dari Tegangan Max")
+        
+        # BH1750 validation
+        if 'bh1750' in thresholds:
+            bh = thresholds['bh1750']
+            if bh.get('luxMin') is not None and bh.get('luxMax') is not None:
+                if bh['luxMin'] > bh['luxMax']:
+                    errors.append("Cahaya Min tidak boleh lebih besar dari Cahaya Max")
+        
+        if errors:
+            raise HTTPException(400, "; ".join(errors))
+            
+        with get_cursor() as cur:
+            import json
+            
+            # Update thresholds
+            cur.execute(
+                "INSERT INTO app_settings (setting_key, setting_value, updated_at) VALUES (%s, %s, NOW()) ON CONFLICT (setting_key) DO UPDATE SET setting_value = %s, updated_at = NOW()",
+                ('thresholds', json.dumps(thresholds), json.dumps(thresholds))
+            )
+            
+            # Update enable_thresholds if provided
+            if settings_data.enable_thresholds is not None:
+                cur.execute(
+                    "INSERT INTO app_settings (setting_key, setting_value, updated_at) VALUES (%s, %s, NOW()) ON CONFLICT (setting_key) DO UPDATE SET setting_value = %s, updated_at = NOW()",
+                    ('enable_thresholds', json.dumps(settings_data.enable_thresholds), json.dumps(settings_data.enable_thresholds))
+                )
+                
+            # Update telegram_config if provided
+            if settings_data.telegram_config is not None:
+                cur.execute(
+                    "INSERT INTO app_settings (setting_key, setting_value, updated_at) VALUES (%s, %s, NOW()) ON CONFLICT (setting_key) DO UPDATE SET setting_value = %s, updated_at = NOW()",
+                    ('telegram_config', json.dumps(settings_data.telegram_config), json.dumps(settings_data.telegram_config))
+                )
+            
+            # Fetch the updated thresholds to return
+            cur.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'thresholds'")
+            result = cur.fetchone()
+            
+            return {
+                "success": True, 
+                "message": "Pengaturan berhasil disimpan",
+                "thresholds": result['setting_value'] if result else thresholds,
+                "enable_thresholds": settings_data.enable_thresholds,
+                "telegram_config": settings_data.telegram_config
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error saving settings: {e}")
+
+@app.post("/notify/telegram/test")
+def test_telegram(data: TelegramTest):
+    """Test send Telegram message"""
+    import requests
+    try:
+        url = f"https://api.telegram.org/bot{data.bot_token}/sendMessage"
+        
+        # Simulasikan pesan alert jika diminta
+        if "alert" in data.message.lower() or data.message == "test_alert":
+            message = "⚠️ *SAMPLE ALERT (TEST)*\nSensor: *DHT22*\nKondisi: *Suhu Tinggi*\nNilai: *36.5 °C* (Batas: 35.0 °C)"
+        else:
+            message = f"🔔 *TEST KONEKSI SUCCESS*\n\n{data.message}\n\nJika Anda menerima pesan ini, berarti Bot Token dan Chat ID Anda sudah benar! ✅"
+
+        payload = {
+            "chat_id": data.chat_id,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code == 200:
+            return {"success": True, "message": "Pesan terkirim!"}
+        else:
+            return {"success": False, "message": f"Gagal: {res.text}"}
+    except Exception as e:
+        raise HTTPException(500, f"Error sending message: {e}")
+
+
+@app.post("/settings/reset")
+def reset_settings():
+    """Reset settings to default values"""
+    try:
+        default_thresholds = {
+            "dht22": {"tempMax": 35, "tempMin": 15, "humMax": 80, "humMin": 30},
+            "mq2": {"smokeMax": 500, "smokeWarn": 350, "lpgMax": 1000, "lpgWarn": 500, "coMax": 500, "coWarn": 200},
+            "pzem004t": {"powerMax": 2000, "voltageMin": 180, "voltageMax": 240, "currentMax": 10, "energyMax": 100, "pfMin": 0.85},
+            "bh1750": {"luxMax": 100000, "luxMin": 0}
+        }
+        
+        default_enable_thresholds = False
+        default_telegram_config = {"bot_token": "", "chat_id": "", "enabled": False}
+
+        with get_cursor() as cur:
+            import json
+            # Reset thresholds
+            cur.execute("""
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES ('thresholds', %s, NOW())
+                ON CONFLICT (setting_key) 
+                DO UPDATE SET setting_value = EXCLUDED.setting_value, updated_at = NOW()
+            """, (json.dumps(default_thresholds),))
+            
+            # Reset enable_thresholds to False
+            cur.execute("""
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES ('enable_thresholds', %s, NOW())
+                ON CONFLICT (setting_key) 
+                DO UPDATE SET setting_value = EXCLUDED.setting_value, updated_at = NOW()
+            """, (json.dumps(default_enable_thresholds),))
+            
+            # Reset telegram_config to disabled
+            cur.execute("""
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES ('telegram_config', %s, NOW())
+                ON CONFLICT (setting_key) 
+                DO UPDATE SET setting_value = EXCLUDED.setting_value, updated_at = NOW()
+            """, (json.dumps(default_telegram_config),))
+            
+            return {
+                "success": True, 
+                "message": "Pengaturan berhasil direset ke default (Notifikasi dinonaktifkan)",
+                "thresholds": default_thresholds,
+                "enable_thresholds": default_enable_thresholds,
+                "telegram_config": default_telegram_config
+            }
+    except Exception as e:
+        raise HTTPException(500, f"Error resetting settings: {e}")
